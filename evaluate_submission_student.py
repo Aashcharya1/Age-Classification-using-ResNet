@@ -6,8 +6,8 @@ validation or test images, and reports overall accuracy.
 
 Usage:
     python evaluate_submission_student.py \
-        --model_path  saved_model.pth \
-        --model_file  model.py \
+        --model_path  b23es1001.pth \
+        --model_file  b23es1001.py \
         --data_dir    dataset/dataset \
         
 """
