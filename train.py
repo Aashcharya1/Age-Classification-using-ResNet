@@ -1,9 +1,16 @@
 """
-Age Classification Training Script
-===================================
-ResNet-18 from scratch | Adam | OneCycleLR | Label Smoothing
+Age Classification Training Script (Phase II)
+============================================
 
-Part 1: Train on train set, checkpoint best val model with fine tuning from pretrained model
+ResNet-18 backbone + SE channel attention + deep bottleneck head,
+trained from scratch with:
+  - Strong anti-bias data augmentation (blur, grayscale, RandAugment, erasing)
+  - Focal Loss (gamma=2.0) to focus on hard / boundary cases
+  - Mixup regularization (alpha=0.20)
+  - Adam optimizer + OneCycleLR schedule
+
+Part 1: Train on train set, checkpoint best val model.
+Part 2: Fine-tune best model on combined train + valid data.
 
 Usage:
     python train.py
@@ -22,6 +29,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torchvision import transforms
+import torch.amp as amp
 
 from model_class import MyAgeClassifier
 
@@ -47,19 +55,20 @@ IMG_EXT      = ('.png', '.jpg', '.jpeg')
 
 # Hyperparameters
 BATCH_SIZE    = 64
-NUM_EPOCHS    = 200            
+NUM_EPOCHS    = 200
 LEARNING_RATE = 1e-3
-WEIGHT_DECAY  = 1e-4           
-LABEL_SMOOTH  = 0.1           
+WEIGHT_DECAY  = 1e-4
 
-# Workers (0 on Windows)
+# Workers
+# On Windows, multiprocessing DataLoader can crash without special guards,
+# so we fall back to single-process loading for reliability.
 NUM_WORKERS = 0 if platform.system() == 'Windows' else 4
 
 # Submission
 ROLL_NO = 'b23es1001'
 
 print(f'\nEpochs: {NUM_EPOCHS}  |  LR: {LEARNING_RATE}  |  WD: {WEIGHT_DECAY}')
-print(f'Batch: {BATCH_SIZE}  |  Label smoothing: {LABEL_SMOOTH}')
+print(f'Batch: {BATCH_SIZE}  |  Loss: FocalLoss(gamma=2.0) with Mixup(alpha=0.20)')
 print(f'Workers: {NUM_WORKERS}')
 
 
@@ -113,13 +122,15 @@ class ValidDataset(Dataset):
 
 # ──────────────────── Transforms ────────────────────
 train_transform = transforms.Compose([
-    transforms.RandomResizedCrop(IMG_SIZE, scale=(0.7, 1.0)),  # Scale variation
-    transforms.RandomHorizontalFlip(p=0.5),                     # Horizontal mirroring
-    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),  # Color variations
-    transforms.RandAugment(num_ops=2, magnitude=5),              # AutoAugment-style
-    transforms.ToTensor(),                                       # PIL to Tensor
-    transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)),         # Cutout regularization
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),  # ImageNet stats
+    transforms.RandomResizedCrop(IMG_SIZE, scale=(0.7, 1.0)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+    transforms.RandAugment(num_ops=2, magnitude=5),
+    transforms.RandomApply([transforms.GaussianBlur(kernel_size=5)], p=0.3),
+    transforms.RandomGrayscale(p=0.15),
+    transforms.ToTensor(),
+    transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
 ])
 
 eval_transform = transforms.Compose([
@@ -132,10 +143,37 @@ print(f'\nTrain transform: {train_transform}')
 print(f'Eval transform:  {eval_transform}')
 
 
+
+import torch.nn.functional as F
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=None):
+        super().__init__()
+        self.gamma = gamma
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
+
+def mixup_data(x, y, alpha=0.20):
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+    batch_size = x.size()[0]
+    index = torch.randperm(batch_size).to(x.device)
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
 # ──────────────────── Training & Validation Functions ────────────────────
 
-def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None):
-    """Standard training loop for one epoch with per-batch scheduler stepping."""
+def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None, scaler=None):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
 
@@ -143,21 +181,41 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None)
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
+        # Mixup augmentation
+        images, labels_a, labels_b, lam = mixup_data(images, labels, alpha=0.20)
+
         optimizer.zero_grad(set_to_none=True)
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-        
-        # Step scheduler per batch (for OneCycleLR)
+
+        if scaler is not None and device.type == 'cuda':
+            # Automatic Mixed Precision (AMP) forward + backward
+            with amp.autocast('cuda'):
+                outputs = model(images)
+                loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            # Fallback: standard FP32 training
+            outputs = model(images)
+            loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
+            loss.backward()
+            optimizer.step()
+
         if scheduler is not None:
             scheduler.step()
 
         total_loss += loss.item() * images.size(0)
-        correct += (outputs.argmax(1) == labels).sum().item()
+        
+        # Approximate accuracy during mixup
+        preds = outputs.argmax(1)
+        correct_a = (preds == labels_a).sum().item()
+        correct_b = (preds == labels_b).sum().item()
+        correct += (lam * correct_a + (1 - lam) * correct_b)
         total += images.size(0)
 
     return total_loss / total, correct / total
+
 
 
 @torch.no_grad()
@@ -239,9 +297,12 @@ print(f'Valid: {len(valid_dataset)} images  ({len(valid_loader)} batches)\n')
 
 # Model, loss, optimizer, scheduler
 model = MyAgeClassifier(num_classes=2).to(DEVICE)
-criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH)
- 
+criterion = FocalLoss(gamma=2.0)
+
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+
+# AMP gradient scaler (used only when running on CUDA)
+scaler = amp.GradScaler('cuda', enabled=(DEVICE.type == 'cuda'))
 
 scheduler = torch.optim.lr_scheduler.OneCycleLR(
     optimizer,
@@ -254,7 +315,7 @@ n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f'Parameters: {n_params:,}')
 print(f'Optimizer:  Adam (lr={LEARNING_RATE}, wd={WEIGHT_DECAY})')
 print(f'Scheduler:  OneCycleLR (max_lr={LEARNING_RATE}, steps_per_epoch={len(train_loader)})')
-print(f'Loss:       CrossEntropyLoss (label_smoothing={LABEL_SMOOTH})\n')
+print(f'Loss:       FocalLoss(gamma=2.0) with Mixup(alpha=0.20)\n')
 
 # Training loop with best-model checkpointing
 best_val_acc = 0.0
@@ -262,7 +323,9 @@ best_epoch = 0
 MIN_EPOCH_FOR_BEST = 15  # Don't save anything until epoch 15
 
 for epoch in range(1, NUM_EPOCHS + 1):
-    train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, DEVICE, scheduler)
+    train_loss, train_acc = train_one_epoch(
+        model, train_loader, optimizer, criterion, DEVICE, scheduler, scaler
+    )
     val_acc = validate(model, valid_loader, DEVICE)
 
     saved = '' 
@@ -304,15 +367,18 @@ print(f'Fine-tuning for {FINETUNE_EPOCHS} epochs with LR={FINETUNE_LR}\n')
 model_final = torch.load('best_model_phase1.pth', map_location=DEVICE, weights_only=False)
 model_final.to(DEVICE)
 
-criterion_final = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH) 
+criterion_final = FocalLoss(gamma=2.0) 
 optimizer_final = optim.Adam(model_final.parameters(), lr=FINETUNE_LR, weight_decay=WEIGHT_DECAY)
 # CosineAnnealing steps per epoch, not per batch
 scheduler_final = optim.lr_scheduler.CosineAnnealingLR(optimizer_final, T_max=FINETUNE_EPOCHS)
 
+# Separate AMP scaler for fine-tuning
+scaler_final = amp.GradScaler('cuda', enabled=(DEVICE.type == 'cuda'))
+
 for epoch in range(1, FINETUNE_EPOCHS + 1):
     train_loss, train_acc = train_one_epoch(
         model_final, combined_loader, optimizer_final, criterion_final, DEVICE,
-        scheduler=None  
+        scheduler=None, scaler=scaler_final
     )
     scheduler_final.step()  # Step per epoch
 
@@ -321,7 +387,7 @@ for epoch in range(1, FINETUNE_EPOCHS + 1):
         print(f'Epoch {epoch:03d}/{FINETUNE_EPOCHS}  '
               f'Loss {train_loss:.4f}  Train {train_acc*100:.1f}%  LR {lr:.6f}')
 
-print('\Part 2 fine-tuning complete.')
+print('\\Part 2 fine-tuning complete.')
 
  
 #  Save submission files 

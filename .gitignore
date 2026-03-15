@@ -1,0 +1,8 @@
+# Ignore dataset folder
+dataset/
+
+# Ignore virtual environment
+venv/
+
+# Ignore phase 2 folder
+phase 2/
